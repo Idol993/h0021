@@ -164,6 +164,137 @@ def probe_audio_info(video_path: str) -> Dict[str, Any]:
     return info
 
 
+def probe_video_info(video_path: str) -> Dict[str, Any]:
+    if ffmpeg is None:
+        raise ImportError("ffmpeg-python is required. Install with: pip install ffmpeg-python")
+    try:
+        probe = ffmpeg.probe(video_path)
+    except Exception as e:
+        return {
+            "file_exists": os.path.isfile(video_path),
+            "file_size_bytes": os.path.getsize(video_path) if os.path.isfile(video_path) else 0,
+            "duration_seconds": 0.0,
+            "width": 0,
+            "height": 0,
+            "video_codec": "",
+            "audio_codec": "",
+            "probe_error": str(e),
+        }
+
+    fmt = probe.get("format", {})
+    video_streams = [s for s in probe.get("streams", []) if s.get("codec_type") == "video"]
+    audio_streams = [s for s in probe.get("streams", []) if s.get("codec_type") == "audio"]
+    vs = video_streams[0] if video_streams else {}
+    aus = audio_streams[0] if audio_streams else {}
+
+    size_bytes = 0
+    try:
+        size_bytes = int(fmt.get("size", os.path.getsize(video_path) if os.path.isfile(video_path) else 0))
+    except Exception:
+        pass
+
+    return {
+        "file_exists": True,
+        "file_size_bytes": size_bytes,
+        "duration_seconds": float(fmt.get("duration", 0.0)),
+        "width": int(vs.get("width", 0)),
+        "height": int(vs.get("height", 0)),
+        "video_codec": vs.get("codec_name", ""),
+        "audio_codec": aus.get("codec_name", ""),
+        "probe_error": "",
+    }
+
+
+def count_srt_lines(srt_path: str) -> int:
+    if not _file_ok_local(srt_path) or srt is None:
+        return 0
+    try:
+        with open(srt_path, "r", encoding="utf-8") as f:
+            return len(list(srt.parse(f.read())))
+    except Exception:
+        return 0
+
+
+def count_translation_fails(fail_log_path: str, src_srt_path: Optional[str] = None) -> int:
+    if not _file_ok_local(fail_log_path):
+        return 0
+    try:
+        marker = os.path.basename(src_srt_path) if src_srt_path else None
+        count = 0
+        with open(fail_log_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if marker and line.startswith("===") and marker not in line:
+                    continue
+                if re.match(r"^\[Line\s+\d+\]", line):
+                    count += 1
+        return count
+    except Exception:
+        return 0
+
+
+def count_merge_conflicts(conflict_log_path: str) -> int:
+    if not _file_ok_local(conflict_log_path):
+        return 0
+    try:
+        count = 0
+        with open(conflict_log_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if re.match(r"^\[Line\s+\d+\]", line):
+                    count += 1
+        return count
+    except Exception:
+        return 0
+
+
+def _file_ok_local(path: str) -> bool:
+    return isinstance(path, str) and os.path.isfile(path) and os.path.getsize(path) > 0
+
+
+def human_size(num_bytes: int) -> str:
+    if num_bytes <= 0:
+        return "0 B"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    i = 0
+    f = float(num_bytes)
+    while f >= 1024 and i < len(units) - 1:
+        f /= 1024
+        i += 1
+    return f"{f:.2f} {units[i]}"
+
+
+def read_state_file(state_path: str) -> Optional[Dict[str, Any]]:
+    if not _file_ok_local(state_path):
+        return None
+    try:
+        with open(state_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def write_state_file(state_path: str, state: Dict[str, Any]) -> None:
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(state_path)) or ".", exist_ok=True)
+        state["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        tmp = state_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+        if os.path.exists(state_path):
+            os.remove(state_path)
+        os.rename(tmp, state_path)
+    except Exception as e:
+        logger.warning(f"Failed to write state file {state_path}: {e}")
+
+
+def stage_completed_in_state(state: Optional[Dict[str, Any]], stage: str) -> bool:
+    if not state:
+        return False
+    stages = state.get("stages", {})
+    s = stages.get(stage, {})
+    return isinstance(s, dict) and s.get("status") == "done" and s.get("output") and _file_ok_local(s.get("output"))
+
+
+
 def extract_audio_to_wav(video_path: str, output_wav_path: str, sample_rate: int = 16000) -> str:
     if ffmpeg is None:
         raise ImportError("ffmpeg-python is required. Install with: pip install ffmpeg-python")
