@@ -1,5 +1,6 @@
 import os
 import sys
+import csv
 import time
 import json
 import logging
@@ -11,13 +12,14 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import click
 from tqdm import tqdm
 
-from presets import PRESETS, list_presets, get_preset
+from presets import PRESETS, list_presets, get_preset, hex_to_ass_color
 from merge_utils import merge_bilingual_srt, check_alignment, TIMESTAMP_TOLERANCE_MS
 from caption_engine import (
     SUPPORTED_VIDEO_EXTS,
     transcribe_video,
     translate_srt,
     burn_subtitles,
+    generate_preview,
     logger as engine_logger,
 )
 
@@ -78,6 +80,40 @@ def _collect_videos(input_path: str, recursive: bool = False) -> List[str]:
     return videos
 
 
+def _build_burn_overrides(
+    font_override: Optional[str] = None,
+    font_name: Optional[str] = None,
+    font_size: Optional[int] = None,
+    primary_color_hex: Optional[str] = None,
+    outline_color_hex: Optional[str] = None,
+    outline_width: Optional[int] = None,
+    margin_v: Optional[int] = None,
+    bg_bar: bool = False,
+    bg_alpha: Optional[float] = None,
+) -> Dict[str, Any]:
+    overrides: Dict[str, Any] = {}
+    if font_override:
+        overrides["font_path"] = font_override
+    if font_name:
+        overrides["font_name"] = font_name
+    if font_size is not None:
+        overrides["font_size"] = font_size
+    if primary_color_hex:
+        overrides["primary_color_hex"] = primary_color_hex
+    if outline_color_hex:
+        overrides["outline_color_hex"] = outline_color_hex
+    if outline_width is not None:
+        overrides["outline_width"] = outline_width
+    if margin_v is not None:
+        overrides["margin_v"] = margin_v
+    if bg_bar:
+        overrides["background_bar"] = True
+        overrides["bg_alpha"] = bg_alpha if bg_alpha is not None else 0.75
+    elif bg_alpha is not None:
+        overrides["bg_alpha"] = bg_alpha
+    return overrides
+
+
 def _process_single_video(args: tuple) -> Dict[str, Any]:
     (
         video_path,
@@ -106,18 +142,20 @@ def _process_single_video(args: tuple) -> Dict[str, Any]:
     ) = args
 
     paths = _derive_paths(video_path, out_dir)
-    result = {
-        "video": video_path,
+    result: Dict[str, Any] = {
+        "video": os.path.basename(video_path),
+        "video_path": video_path,
         "stages": {},
         "errors": [],
         "skipped": [],
+        "output_files": {},
     }
     t_start = time.time()
 
     try:
         if not skip_transcribe:
             if _file_ok(paths["src_srt"]):
-                result["skipped"].append("transcribe (already exists)")
+                result["skipped"].append("transcribe")
             else:
                 engine_logger.info(f"[{os.path.basename(video_path)}] STAGE 1/4: Transcribe")
                 t0 = time.time()
@@ -132,10 +170,11 @@ def _process_single_video(args: tuple) -> Dict[str, Any]:
                     vad_filter=vad_filter,
                 )
                 result["stages"]["transcribe"] = round(time.time() - t0, 2)
+                result["output_files"]["src_srt"] = paths["src_srt"]
 
         if not skip_translate:
             if _file_ok(paths["tgt_srt"]):
-                result["skipped"].append("translate (already exists)")
+                result["skipped"].append("translate")
             elif _file_ok(paths["src_srt"]):
                 engine_logger.info(f"[{os.path.basename(video_path)}] STAGE 2/4: Translate")
                 t0 = time.time()
@@ -147,12 +186,13 @@ def _process_single_video(args: tuple) -> Dict[str, Any]:
                     fail_log_path=paths["translate_fail"],
                 )
                 result["stages"]["translate"] = round(time.time() - t0, 2)
+                result["output_files"]["tgt_srt"] = paths["tgt_srt"]
             else:
                 result["errors"].append("translate skipped: source SRT missing")
 
         if not skip_merge:
             if _file_ok(paths["bilingual_srt"]):
-                result["skipped"].append("merge (already exists)")
+                result["skipped"].append("merge")
             elif _file_ok(paths["src_srt"]) and _file_ok(paths["tgt_srt"]):
                 engine_logger.info(f"[{os.path.basename(video_path)}] STAGE 3/4: Merge Bilingual")
                 t0 = time.time()
@@ -166,8 +206,9 @@ def _process_single_video(args: tuple) -> Dict[str, Any]:
                     conflict_log_path=paths["merge_conflict"],
                 )
                 result["stages"]["merge"] = round(time.time() - t0, 2)
+                result["output_files"]["bilingual_srt"] = paths["bilingual_srt"]
                 if conflicts:
-                    result["skipped"].append(f"merge: {len(conflicts)} conflict(s) logged")
+                    result["skipped"].append(f"merge: {len(conflicts)} conflict(s)")
                 if not ok:
                     result["errors"].append("merge aborted due to conflicts")
             else:
@@ -175,7 +216,7 @@ def _process_single_video(args: tuple) -> Dict[str, Any]:
 
         if not skip_burn:
             if _file_ok(paths["output_video"]):
-                result["skipped"].append("burn (already exists)")
+                result["skipped"].append("burn")
             else:
                 use_bilingual = _file_ok(paths["bilingual_srt"])
                 use_src = _file_ok(paths["src_srt"])
@@ -199,12 +240,66 @@ def _process_single_video(args: tuple) -> Dict[str, Any]:
                         extra_margin_v=extra_margin_v,
                     )
                     result["stages"]["burn"] = round(time.time() - t0, 2)
+                    result["output_files"]["output_video"] = paths["output_video"]
     except Exception as e:
         result["errors"].append(f"FATAL: {str(e)}")
         result["traceback"] = traceback.format_exc()
 
     result["total_time"] = round(time.time() - t_start, 2)
+    result["status"] = "OK" if not result["errors"] else "FAIL"
     return result
+
+
+def _write_report_json(results: List[Dict[str, Any]], report_path: str, elapsed_total: float) -> None:
+    report = {
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "total_elapsed_seconds": round(elapsed_total, 2),
+        "summary": {
+            "total": len(results),
+            "ok": sum(1 for r in results if r.get("status") == "OK"),
+            "fail": sum(1 for r in results if r.get("status") == "FAIL"),
+        },
+        "videos": [],
+    }
+    for r in results:
+        entry = {
+            "video": r.get("video", ""),
+            "video_path": r.get("video_path", ""),
+            "status": r.get("status", "FAIL"),
+            "total_time": r.get("total_time", 0),
+            "stages": r.get("stages", {}),
+            "skipped": r.get("skipped", []),
+            "errors": r.get("errors", []),
+            "output_files": r.get("output_files", {}),
+        }
+        report["videos"].append(entry)
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+
+
+def _write_report_csv(results: List[Dict[str, Any]], report_path: str, elapsed_total: float) -> None:
+    fieldnames = [
+        "video", "status", "total_time",
+        "transcribe_time", "translate_time", "merge_time", "burn_time",
+        "skipped", "errors", "output_video",
+    ]
+    with open(report_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for r in results:
+            stages = r.get("stages", {})
+            writer.writerow({
+                "video": r.get("video", ""),
+                "status": r.get("status", "FAIL"),
+                "total_time": r.get("total_time", 0),
+                "transcribe_time": stages.get("transcribe", ""),
+                "translate_time": stages.get("translate", ""),
+                "merge_time": stages.get("merge", ""),
+                "burn_time": stages.get("burn", ""),
+                "skipped": "; ".join(r.get("skipped", [])),
+                "errors": "; ".join(r.get("errors", [])),
+                "output_video": r.get("output_files", {}).get("output_video", ""),
+            })
 
 
 @click.group(invoke_without_command=True)
@@ -279,29 +374,32 @@ def cmd_translate(input_srt, output_srt, source_lang, target_lang, fail_log, no_
 @click.option("--font", "font_override", default=None, help="Override font file path")
 @click.option("--font-name", default=None, help="Override font name (for ASS)")
 @click.option("--font-size", type=int, default=None, help="Override font size")
-@click.option("--color", "primary_color_hex", default=None, help="Text color #RRGGBB")
-@click.option("--outline", "outline_width", type=int, default=None, help="Outline thickness")
-@click.option("--margin", "margin_v", type=int, default=None, help="Bottom margin (px)")
+@click.option("--color", "primary_color_hex", default=None, help="Text color in #RRGGBB (e.g. #FF0000 for red)")
+@click.option("--outline-color", "outline_color_hex", default=None, help="Outline color in #RRGGBB (e.g. #000000 for black)")
+@click.option("--outline", "outline_width", type=int, default=None, help="Outline thickness in pixels")
+@click.option("--margin", "margin_v", type=int, default=None, help="Bottom margin in pixels")
+@click.option("--bg-bar", is_flag=True, help="Enable semi-transparent background bar behind text")
+@click.option("--bg-alpha", type=float, default=None, help="Background bar opacity 0.0-1.0 (default 0.75, requires --bg-bar)")
 @click.option("--crf", type=int, default=23, help="x264 CRF (default 23, lower=better)")
 @click.option("--ffmpeg-preset", type=click.Choice(["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"]), default="ultrafast", help="Encoding preset (speed/size tradeoff)")
 def cmd_burn(video_path, output_video, src_srt, tgt_srt, bilingual_srt, preset, style_json,
-             font_override, font_name, font_size, primary_color_hex, outline_width, margin_v,
-             crf, ffmpeg_preset):
+             font_override, font_name, font_size, primary_color_hex, outline_color_hex,
+             outline_width, margin_v, bg_bar, bg_alpha, crf, ffmpeg_preset):
     if output_video is None:
         stem = Path(video_path).stem
         output_video = os.path.join(os.path.dirname(os.path.abspath(video_path)), f"{stem}_subtitled.mp4")
 
-    overrides: Dict[str, Any] = {}
-    if font_override:
-        overrides["font_path"] = font_override
-    if font_name:
-        overrides["font_name"] = font_name
-    if font_size is not None:
-        overrides["font_size"] = font_size
-    if outline_width is not None:
-        overrides["outline_width"] = outline_width
-    if margin_v is not None:
-        overrides["margin_v"] = margin_v
+    overrides = _build_burn_overrides(
+        font_override=font_override,
+        font_name=font_name,
+        font_size=font_size,
+        primary_color_hex=primary_color_hex,
+        outline_color_hex=outline_color_hex,
+        outline_width=outline_width,
+        margin_v=margin_v,
+        bg_bar=bg_bar,
+        bg_alpha=bg_alpha,
+    )
 
     burn_subtitles(
         input_video_path=video_path,
@@ -316,6 +414,57 @@ def cmd_burn(video_path, output_video, src_srt, tgt_srt, bilingual_srt, preset, 
         preset=ffmpeg_preset,
     )
     click.echo(f"Burned -> {output_video}")
+
+
+@cli.command("preview", help="Generate a preview screenshot with subtitle overlay at a given timestamp")
+@click.argument("video_path", type=click.Path(exists=True, dir_okay=False))
+@click.option("--src-srt", default=None, help="Source-language SRT path")
+@click.option("--tgt-srt", default=None, help="Target-language SRT path")
+@click.option("--bilingual-srt", default=None, help="Pre-merged bilingual SRT (takes precedence)")
+@click.option("-t", "--timestamp", default="00:00:05", help="Timestamp to capture (HH:MM:SS or seconds)")
+@click.option("-o", "--output", "output_image", type=click.Path(dir_okay=False), default=None, help="Output image path (default: <video>_preview.png)")
+@click.option("--preset", type=click.Choice(list(PRESETS.keys())), default="white", help="Built-in style preset")
+@click.option("--style-json", default=None, help="Custom style JSON file path")
+@click.option("--font", "font_override", default=None, help="Override font file path")
+@click.option("--font-name", default=None, help="Override font name")
+@click.option("--font-size", type=int, default=None, help="Override font size")
+@click.option("--color", "primary_color_hex", default=None, help="Text color #RRGGBB")
+@click.option("--outline-color", "outline_color_hex", default=None, help="Outline color #RRGGBB")
+@click.option("--outline", "outline_width", type=int, default=None, help="Outline thickness")
+@click.option("--margin", "margin_v", type=int, default=None, help="Bottom margin (px)")
+@click.option("--bg-bar", is_flag=True, help="Enable semi-transparent background bar")
+@click.option("--bg-alpha", type=float, default=None, help="Background bar opacity 0.0-1.0")
+def cmd_preview(video_path, src_srt, tgt_srt, bilingual_srt, timestamp, output_image,
+                preset, style_json, font_override, font_name, font_size, primary_color_hex,
+                outline_color_hex, outline_width, margin_v, bg_bar, bg_alpha):
+    if output_image is None:
+        stem = Path(video_path).stem
+        output_image = os.path.join(os.path.dirname(os.path.abspath(video_path)), f"{stem}_preview.png")
+
+    overrides = _build_burn_overrides(
+        font_override=font_override,
+        font_name=font_name,
+        font_size=font_size,
+        primary_color_hex=primary_color_hex,
+        outline_color_hex=outline_color_hex,
+        outline_width=outline_width,
+        margin_v=margin_v,
+        bg_bar=bg_bar,
+        bg_alpha=bg_alpha,
+    )
+
+    generate_preview(
+        video_path=video_path,
+        output_image_path=output_image,
+        timestamp=timestamp,
+        src_srt_path=src_srt,
+        tgt_srt_path=tgt_srt,
+        bilingual_srt_path=bilingual_srt,
+        preset_name=preset,
+        custom_style_json=style_json,
+        preset_overrides=overrides if overrides else None,
+    )
+    click.echo(f"Preview -> {output_image}")
 
 
 @cli.command("merge", help="Merge source + target SRT into bilingual SRT")
@@ -383,11 +532,21 @@ def cmd_check_align(a_srt, b_srt, tolerance_ms):
 @click.option("--extra-margin", type=int, default=0, help="Extra bottom margin (px) for burn")
 @click.option("--beam-size", type=int, default=5, help="Whisper beam size")
 @click.option("--no-vad-filter", is_flag=True, help="Disable Whisper VAD filter")
+@click.option("--color", "primary_color_hex", default=None, help="Text color #RRGGBB for burn stage")
+@click.option("--outline-color", "outline_color_hex", default=None, help="Outline color #RRGGBB for burn stage")
+@click.option("--outline", "outline_width", type=int, default=None, help="Outline thickness for burn stage")
+@click.option("--font-size", type=int, default=None, help="Font size for burn stage")
+@click.option("--margin", "margin_v", type=int, default=None, help="Bottom margin (px) for burn stage")
+@click.option("--bg-bar", is_flag=True, help="Enable semi-transparent background bar for burn stage")
+@click.option("--bg-alpha", type=float, default=None, help="Background bar opacity 0.0-1.0")
+@click.option("--report", "report_path", default=None, help="Write processing report to this path (auto-detect format by extension .json/.csv, or specify --report-format)")
+@click.option("--report-format", type=click.Choice(["json", "csv"]), default=None, help="Report format (auto-detected from --report extension if omitted)")
 def cmd_pipe(input_path, output_dir, recursive, whisper_model, device, compute_type,
              whisper_language, source_lang, target_lang, preset_name, style_json,
              merge_layout, merge_top, force_merge, skip_transcribe, skip_translate,
              skip_merge, skip_burn, workers, dry_run, crf, ffmpeg_preset, extra_margin,
-             beam_size, no_vad_filter):
+             beam_size, no_vad_filter, primary_color_hex, outline_color_hex, outline_width,
+             font_size, margin_v, bg_bar, bg_alpha, report_path, report_format):
     videos = _collect_videos(input_path, recursive=recursive)
     if not videos:
         click.echo("No supported video files found.")
@@ -402,7 +561,15 @@ def cmd_pipe(input_path, output_dir, recursive, whisper_model, device, compute_t
     if skip_burn:
         logger.info("Skipping burn stage (--skip-burn)")
 
-    overrides: Dict[str, Any] = {}
+    overrides = _build_burn_overrides(
+        primary_color_hex=primary_color_hex,
+        outline_color_hex=outline_color_hex,
+        outline_width=outline_width,
+        font_size=font_size,
+        margin_v=margin_v,
+        bg_bar=bg_bar,
+        bg_alpha=bg_alpha,
+    )
 
     pending: List[str] = []
     skip_reasons: Dict[str, str] = {}
@@ -418,9 +585,6 @@ def cmd_pipe(input_path, output_dir, recursive, whisper_model, device, compute_t
             if not _file_ok(paths["src_srt"]):
                 skip_reasons[vp] = "skip-transcribe set but src SRT missing"
                 continue
-
-        if skip_burn and not _file_ok(paths["output_video"]):
-            pass
 
         pending.append(vp)
 
@@ -479,7 +643,7 @@ def cmd_pipe(input_path, output_dir, recursive, whisper_model, device, compute_t
 
     def _on_complete(res: Dict[str, Any]):
         results.append(res)
-        base = os.path.basename(res["video"])
+        base = res.get("video", "")
         errors = res.get("errors", [])
         stages = res.get("stages", {})
         total = res.get("total_time", 0)
@@ -501,14 +665,14 @@ def cmd_pipe(input_path, output_dir, recursive, whisper_model, device, compute_t
                     r = fut.result()
                 except Exception as e:
                     a = futures[fut]
-                    r = {"video": a[0], "errors": [f"worker crash: {e}"], "stages": {}, "skipped": []}
+                    r = {"video": os.path.basename(a[0]), "video_path": a[0], "errors": [f"worker crash: {e}"], "stages": {}, "skipped": [], "status": "FAIL"}
                 _on_complete(r)
 
     pbar.close()
     elapsed_total = time.time() - t_start_all
 
-    n_ok = sum(1 for r in results if not r.get("errors"))
-    n_fail = sum(1 for r in results if r.get("errors"))
+    n_ok = sum(1 for r in results if r.get("status") == "OK")
+    n_fail = sum(1 for r in results if r.get("status") == "FAIL")
 
     click.echo()
     click.echo("=" * 60)
@@ -518,15 +682,42 @@ def cmd_pipe(input_path, output_dir, recursive, whisper_model, device, compute_t
     click.echo()
 
     for r in results:
-        base = os.path.basename(r["video"])
-        tag = "OK  " if not r.get("errors") else "FAIL"
+        base = r.get("video", "")
+        tag = "OK  " if r.get("status") == "OK" else "FAIL"
         stages = r.get("stages", {})
         stage_str = " ".join(f"{k}={v}s" for k, v in stages.items())
         skipped = r.get("skipped", [])
-        skip_str = f" (skip: {len(skipped)})" if skipped else ""
+        skip_str = f" (skip: {', '.join(skipped)})" if skipped else ""
         click.echo(f"  [{tag}] {base}  total={r.get('total_time')}s  {stage_str}{skip_str}")
         for err in r.get("errors", []):
             click.echo(f"          ! {err}")
+
+    if report_path:
+        fmt = report_format
+        if not fmt:
+            ext = os.path.splitext(report_path)[1].lower()
+            if ext == ".csv":
+                fmt = "csv"
+            else:
+                fmt = "json"
+
+        report_dir = os.path.dirname(os.path.abspath(report_path))
+        if report_dir:
+            os.makedirs(report_dir, exist_ok=True)
+
+        if fmt == "csv":
+            _write_report_csv(results, report_path, elapsed_total)
+        else:
+            _write_report_json(results, report_path, elapsed_total)
+        click.echo(f"\nReport saved -> {report_path}")
+    else:
+        auto_report = os.path.join(output_dir or ".", "pipeline_report.json") if output_dir else None
+        if not auto_report and results:
+            first_video_dir = os.path.dirname(os.path.abspath(results[0].get("video_path", ".")))
+            auto_report = os.path.join(first_video_dir, "pipeline_report.json")
+        if auto_report:
+            _write_report_json(results, auto_report, elapsed_total)
+            click.echo(f"\nReport saved -> {auto_report}")
 
 
 @cli.command("list-presets", help="Show built-in subtitle style presets")

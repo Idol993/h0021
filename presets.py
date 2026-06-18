@@ -95,9 +95,15 @@ def resolve_font_path() -> str:
 
 
 def _to_ass_color(hex_rgb: str, alpha: float = 0.0) -> str:
+    return hex_to_ass_color(hex_rgb, alpha)
+
+
+def hex_to_ass_color(hex_rgb: str, alpha: float = 0.0) -> str:
     hex_rgb = hex_rgb.lstrip("#")
     if len(hex_rgb) == 3:
         hex_rgb = "".join(c * 2 for c in hex_rgb)
+    if len(hex_rgb) != 6:
+        return "&H00FFFFFF"
     r, g, b = int(hex_rgb[0:2], 16), int(hex_rgb[2:4], 16), int(hex_rgb[4:6], 16)
     a = int(alpha * 255)
     return f"&H{a:02X}{b:02X}{g:02X}{r:02X}"

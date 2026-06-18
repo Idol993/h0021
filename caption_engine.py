@@ -37,7 +37,7 @@ except ImportError:
 if TYPE_CHECKING:
     from srt import Subtitle
 
-from presets import SubtitleStyle, get_preset, load_style_from_json, resolve_font_path
+from presets import SubtitleStyle, get_preset, load_style_from_json, resolve_font_path, hex_to_ass_color
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -473,9 +473,24 @@ def _srt_to_ass_text(srt_path: str, style: SubtitleStyle, is_second: bool = Fals
     font_name = style.font_name or "Arial"
     font_size = int(style.font_size * (style.second_font_size_scale if is_second else 1.0))
     primary = style.primary_color
-    outline = style.outline_color
+    outline_col = style.outline_color
     outline_w = style.outline_width
     shadow = style.shadow
+    back_col = style.back_color
+    border_style = style.border_style
+    margin_v = style.margin_v
+
+    if style.background_bar:
+        border_style = 3
+        back_col = hex_to_ass_color("#000000", alpha=style.bg_alpha)
+        outline_w = max(outline_w, 8)
+        shadow = 0
+
+    if is_second:
+        if style.background_bar:
+            margin_v = margin_v + font_size + outline_w + 6
+        else:
+            margin_v = margin_v + font_size + 8
 
     def fmt_time(td: timedelta) -> str:
         total_sec = td.total_seconds()
@@ -484,19 +499,14 @@ def _srt_to_ass_text(srt_path: str, style: SubtitleStyle, is_second: bool = Fals
         s = total_sec % 60
         return f"{h:d}:{m:02d}:{s:05.2f}"
 
-    margin_v = style.margin_v
-    if is_second:
-        if style.background_bar:
-            margin_v = margin_v + font_size + 10
-        else:
-            margin_v = margin_v + font_size + 8
-
     lines: List[str] = []
     lines.append("[Script Info]")
     lines.append("Title: Bilingual Subtitles")
     lines.append("ScriptType: v4.00+")
     lines.append("WrapStyle: 2")
     lines.append("ScaledBorderAndShadow: yes")
+    lines.append("PlayResX: 1920")
+    lines.append("PlayResY: 1080")
     lines.append("")
     lines.append("[V4+ Styles]")
     lines.append(
@@ -506,8 +516,8 @@ def _srt_to_ass_text(srt_path: str, style: SubtitleStyle, is_second: bool = Fals
     )
     style_name = "Second" if is_second else "Default"
     lines.append(
-        f"Style: {style_name},{font_name},{font_size},{primary},&H000000FF,{outline},"
-        f"{style.back_color},0,0,0,0,100,100,{style.spacing},0,{style.border_style},"
+        f"Style: {style_name},{font_name},{font_size},{primary},&H000000FF,{outline_col},"
+        f"{back_col},0,0,0,0,100,100,{style.spacing},0,{border_style},"
         f"{outline_w},{shadow},{style.alignment},{style.margin_l},{style.margin_r},{margin_v},1"
     )
     lines.append("")
@@ -554,8 +564,30 @@ def burn_subtitles(
             style = get_preset(preset_name)
 
     if preset_overrides:
+        hex_color_keys = {
+            "primary_color_hex": "primary_color",
+            "outline_color_hex": "outline_color",
+            "back_color_hex": "back_color",
+        }
         for k, v in preset_overrides.items():
-            if hasattr(style, k):
+            if k in hex_color_keys:
+                ass_key = hex_color_keys[k]
+                alpha = preset_overrides.get(k.replace("_hex", "_alpha"), 0.0)
+                if k == "back_color_hex":
+                    alpha = preset_overrides.get("bg_alpha", style.bg_alpha)
+                setattr(style, ass_key, hex_to_ass_color(str(v), alpha=alpha))
+            elif k == "bg_alpha":
+                style.bg_alpha = float(v)
+                if style.background_bar:
+                    style.back_color = hex_to_ass_color("#000000", alpha=style.bg_alpha)
+            elif k == "background_bar":
+                style.background_bar = bool(v)
+                if style.background_bar:
+                    style.border_style = 3
+                    style.back_color = hex_to_ass_color("#000000", alpha=style.bg_alpha)
+                else:
+                    style.border_style = 1
+            elif hasattr(style, k):
                 setattr(style, k, v)
 
     if extra_margin_v:
@@ -566,9 +598,14 @@ def burn_subtitles(
         resolved = resolve_font_path()
         if resolved:
             style.font_path = resolved
+            style.font_name = os.path.splitext(os.path.basename(resolved))[0]
 
     logger.info(f"[Burn] {os.path.basename(input_video_path)}")
-    logger.info(f"  Style: {preset_name}, font={style.font_name}({style.font_size})")
+    logger.info(
+        f"  Style: preset={preset_name}, font={style.font_name}({style.font_size}), "
+        f"color={style.primary_color}, outline={style.outline_color}/{style.outline_width}px, "
+        f"bg_bar={style.background_bar}(alpha={style.bg_alpha}), margin_v={style.margin_v}"
+    )
 
     with tempfile.TemporaryDirectory(prefix="ass_subs_") as tmpdir:
         ass_inputs: List[str] = []
@@ -628,3 +665,130 @@ def burn_subtitles(
 
     logger.info(f"  Output: {output_video_path}")
     return output_video_path
+
+
+def _parse_timestamp(ts_str: str) -> float:
+    if not ts_str:
+        return 0.0
+    ts_str = ts_str.strip()
+    parts = ts_str.replace(",", ".").split(":")
+    if len(parts) == 3:
+        return float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
+    elif len(parts) == 2:
+        return float(parts[0]) * 60 + float(parts[1])
+    else:
+        return float(ts_str)
+
+
+def generate_preview(
+    video_path: str,
+    output_image_path: str,
+    timestamp: str = "00:00:05",
+    src_srt_path: Optional[str] = None,
+    tgt_srt_path: Optional[str] = None,
+    bilingual_srt_path: Optional[str] = None,
+    style: Optional[SubtitleStyle] = None,
+    preset_name: str = "white",
+    custom_style_json: Optional[str] = None,
+    preset_overrides: Optional[Dict[str, Any]] = None,
+    width: int = 1920,
+    height: int = 1080,
+) -> str:
+    if ffmpeg is None:
+        raise ImportError("ffmpeg-python is required. Install with: pip install ffmpeg-python")
+    if srt is None:
+        raise ImportError("srt package is required. Install with: pip install srt")
+
+    if not bilingual_srt_path and not src_srt_path and not tgt_srt_path:
+        raise ValueError("At least one SRT file must be provided")
+
+    if style is None:
+        if custom_style_json:
+            style = load_style_from_json(custom_style_json)
+        else:
+            style = get_preset(preset_name)
+
+    if preset_overrides:
+        hex_color_keys = {
+            "primary_color_hex": "primary_color",
+            "outline_color_hex": "outline_color",
+            "back_color_hex": "back_color",
+        }
+        for k, v in preset_overrides.items():
+            if k in hex_color_keys:
+                ass_key = hex_color_keys[k]
+                alpha = preset_overrides.get(k.replace("_hex", "_alpha"), 0.0)
+                if k == "back_color_hex":
+                    alpha = preset_overrides.get("bg_alpha", style.bg_alpha)
+                setattr(style, ass_key, hex_to_ass_color(str(v), alpha=alpha))
+            elif k == "bg_alpha":
+                style.bg_alpha = float(v)
+                if style.background_bar:
+                    style.back_color = hex_to_ass_color("#000000", alpha=style.bg_alpha)
+            elif k == "background_bar":
+                style.background_bar = bool(v)
+                if style.background_bar:
+                    style.border_style = 3
+                    style.back_color = hex_to_ass_color("#000000", alpha=style.bg_alpha)
+                else:
+                    style.border_style = 1
+            elif hasattr(style, k):
+                setattr(style, k, v)
+
+    style.font_name = style.font_name or "Arial"
+    if not style.font_path:
+        resolved = resolve_font_path()
+        if resolved:
+            style.font_path = resolved
+            style.font_name = os.path.splitext(os.path.basename(resolved))[0]
+
+    ts_sec = _parse_timestamp(timestamp)
+    logger.info(f"[Preview] {os.path.basename(video_path)} @ {timestamp} ({ts_sec:.1f}s)")
+
+    with tempfile.TemporaryDirectory(prefix="preview_ass_") as tmpdir:
+        ass_inputs: List[str] = []
+        srt_paths = []
+        if bilingual_srt_path:
+            srt_paths.append((bilingual_srt_path, False))
+        else:
+            if src_srt_path:
+                srt_paths.append((src_srt_path, False))
+            if tgt_srt_path:
+                srt_paths.append((tgt_srt_path, True))
+
+        for i, (srt_p, is_second) in enumerate(srt_paths):
+            ass_text = _srt_to_ass_text(srt_p, style, is_second=is_second)
+            ass_path = os.path.join(tmpdir, f"preview_sub{i}.ass")
+            with open(ass_path, "w", encoding="utf-8") as f:
+                f.write(ass_text)
+            ass_inputs.append(ass_path)
+
+        stream = ffmpeg.input(video_path, ss=ts_sec)
+
+        video_stream = stream["v"]
+
+        font_dir = os.path.dirname(style.font_path) if style.font_path and os.path.dirname(style.font_path) else None
+        for idx, ass_path in enumerate(ass_inputs):
+            vf_kwargs = {"filename": ass_path}
+            if font_dir:
+                vf_kwargs["fontsdir"] = font_dir
+            video_stream = video_stream.filter("ass", **vf_kwargs)
+
+        video_stream = video_stream.filter("scale", width, height)
+
+        os.makedirs(os.path.dirname(os.path.abspath(output_image_path)) or ".", exist_ok=True)
+        stream_out = ffmpeg.output(
+            video_stream,
+            output_image_path,
+            vframes=1,
+            f="image2",
+        )
+        cmd = stream_out.overwrite_output().compile()
+
+        logger.info(f"  Capturing frame at {timestamp}...")
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"Preview capture failed: {result.stderr[-800:]}")
+
+    logger.info(f"  Preview saved: {output_image_path}")
+    return output_image_path
