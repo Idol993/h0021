@@ -4,6 +4,7 @@ import os
 import re
 import sys
 import json
+import time
 import wave
 import logging
 import tempfile
@@ -274,19 +275,55 @@ def read_state_file(state_path: str) -> Optional[Dict[str, Any]]:
 
 def write_state_file(state_path: str, state: Dict[str, Any]) -> bool:
     try:
-        os.makedirs(os.path.dirname(os.path.abspath(state_path)) or ".", exist_ok=True)
-        state = dict(state)
-        state["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        dir_path = os.path.dirname(os.path.abspath(state_path)) or "."
+        os.makedirs(dir_path, exist_ok=True)
+        state_copy = dict(state)
+        state_copy["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+
+        try:
+            json.dumps(state_copy, ensure_ascii=False)
+        except (TypeError, ValueError) as e:
+            logger.error(f"State is not JSON serializable for {state_path}: {e}")
+            return False
+
         tmp = state_path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
-        if os.path.exists(state_path):
-            os.replace(tmp, state_path)
-        else:
-            os.rename(tmp, state_path)
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(state_copy, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+        except Exception as e:
+            logger.error(f"Failed to write tmp state file {tmp}: {e}")
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
+            return False
+
+        try:
+            if os.path.exists(state_path):
+                os.replace(tmp, state_path)
+            else:
+                os.rename(tmp, state_path)
+        except Exception as e:
+            logger.error(f"Failed to rename tmp to final state {state_path}: {e}")
+            try:
+                if os.path.exists(state_path):
+                    os.replace(tmp, state_path)
+                else:
+                    os.rename(tmp, state_path)
+            except Exception as e2:
+                logger.error(f"Retry also failed: {e2}")
+                if os.path.exists(tmp):
+                    try:
+                        os.remove(tmp)
+                    except Exception:
+                        pass
+                return False
         return True
     except Exception as e:
-        logger.error(f"Failed to write state file {state_path}: {e}")
+        logger.error(f"Unexpected error writing state file {state_path}: {e}")
         return False
 
 
