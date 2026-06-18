@@ -272,18 +272,22 @@ def read_state_file(state_path: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def write_state_file(state_path: str, state: Dict[str, Any]) -> None:
+def write_state_file(state_path: str, state: Dict[str, Any]) -> bool:
     try:
         os.makedirs(os.path.dirname(os.path.abspath(state_path)) or ".", exist_ok=True)
+        state = dict(state)
         state["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
         tmp = state_path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(state, f, ensure_ascii=False, indent=2)
         if os.path.exists(state_path):
-            os.remove(state_path)
-        os.rename(tmp, state_path)
+            os.replace(tmp, state_path)
+        else:
+            os.rename(tmp, state_path)
+        return True
     except Exception as e:
-        logger.warning(f"Failed to write state file {state_path}: {e}")
+        logger.error(f"Failed to write state file {state_path}: {e}")
+        return False
 
 
 def stage_completed_in_state(state: Optional[Dict[str, Any]], stage: str) -> bool:

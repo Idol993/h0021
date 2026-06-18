@@ -222,6 +222,14 @@ def _process_single_video(args: tuple) -> Dict[str, Any]:
     if video_info.get("probe_error"):
         report["errors"].append(f"video probe failed: {video_info['probe_error']}")
 
+    def _safe_write_state() -> bool:
+        ok = write_state_file(paths["state"], state)
+        if not ok:
+            err = f"state file write failed: {paths['state']}"
+            if err not in report["errors"]:
+                report["errors"].append(err)
+        return ok
+
     def _mark_stage_done(stg: str, output_path: str, elapsed: float, extra: Optional[Dict] = None):
         state["stages"][stg] = {
             "status": "done",
@@ -231,7 +239,7 @@ def _process_single_video(args: tuple) -> Dict[str, Any]:
         }
         if extra:
             state["stages"][stg].update(extra)
-        write_state_file(paths["state"], state)
+        _safe_write_state()
 
     def _mark_stage_user_skip(stg: str):
         state["stages"][stg] = {
@@ -239,7 +247,7 @@ def _process_single_video(args: tuple) -> Dict[str, Any]:
             "reason": "user passed --skip-" + stg,
             "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
-        write_state_file(paths["state"], state)
+        _safe_write_state()
 
     def _mark_stage_ready_skip(stg: str, reason: str):
         state["stages"][stg] = {
@@ -247,7 +255,7 @@ def _process_single_video(args: tuple) -> Dict[str, Any]:
             "reason": reason,
             "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
-        write_state_file(paths["state"], state)
+        _safe_write_state()
 
     def _mark_stage_fail(stg: str, err: str):
         state["stages"][stg] = {
@@ -255,7 +263,7 @@ def _process_single_video(args: tuple) -> Dict[str, Any]:
             "error": err,
             "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
-        write_state_file(paths["state"], state)
+        _safe_write_state()
 
     try:
         for stg, skip_flag, out_key in [
@@ -285,9 +293,9 @@ def _process_single_video(args: tuple) -> Dict[str, Any]:
             if _file_ok(out_path):
                 report["stages"][stg] = None
                 report["skipped_stages"].append(stg)
-                report["stage_reasons"][stg] = "cached: output exists"
+                report["stage_reasons"][stg] = "resume: output file exists"
                 report["output_files"][out_key] = out_path
-                _mark_stage_ready_skip(stg, "output file already exists before run")
+                _mark_stage_ready_skip(stg, "output file already exists (resumed)")
                 continue
 
             if stg == "transcribe":
@@ -453,7 +461,9 @@ def _process_single_video(args: tuple) -> Dict[str, Any]:
 
     state["status"] = report["status"]
     state["total_time_seconds"] = report["total_time"]
-    write_state_file(paths["state"], state)
+    if not _safe_write_state():
+        if "state file write failed" not in " ".join(report["errors"]):
+            report["errors"].append(f"final state file write failed: {paths['state']}")
 
     return report
 
@@ -833,14 +843,24 @@ def cmd_inspect(input_path, output_dir, recursive, export_path, show_complete, o
         click.echo("No supported video files found.")
         sys.exit(0)
 
-    rows: List[Dict[str, Any]] = []
+    all_infos: List[Dict[str, Any]] = []
     click.echo(f"Inspecting {len(videos)} video(s)...\n")
 
     for vp in tqdm(videos, desc="Scan", unit="video"):
         info = _inspect_one(vp, output_dir)
-        if only_missing and info["complete"]:
+        all_infos.append(info)
+
+    total = len(all_infos)
+    total_complete = sum(1 for info in all_infos if info.get("complete"))
+    total_incomplete = total - total_complete
+
+    display_rows: List[Dict[str, Any]] = []
+    for info in all_infos:
+        if only_missing and info.get("complete"):
             continue
-        rows.append(info)
+        if not show_complete and info.get("complete"):
+            continue
+        display_rows.append(info)
 
     col_keys = [k for k, _ in INSPECT_COLUMNS]
     col_labels = [l for _, l in INSPECT_COLUMNS]
@@ -848,8 +868,7 @@ def cmd_inspect(input_path, output_dir, recursive, export_path, show_complete, o
     click.echo(" | ".join(["VIDEO"] + col_labels))
     click.echo("-" * (len("VIDEO") + 5 + sum(len(l) + 3 for l in col_labels)))
 
-    complete = 0
-    for info in rows:
+    for info in display_rows:
         vals = []
         for k in col_keys:
             if k in ("has_video", "has_src_srt", "has_tgt_srt", "has_bilingual_srt", "has_output", "has_preview", "has_state"):
@@ -858,17 +877,15 @@ def cmd_inspect(input_path, output_dir, recursive, export_path, show_complete, o
                 v = info.get(k, "")
                 vals.append(str(v) if v not in (None, "") else "-")
         status = "OK" if info.get("complete") else "MISSING"
-        if info.get("complete"):
-            complete += 1
-        if not show_complete and info.get("complete"):
-            continue
         click.echo(" | ".join([info["video"][:30]] + vals) + f" [{status}]")
 
     click.echo()
     click.echo("=" * 60)
-    click.echo(f"Total scanned:  {len(videos)}")
-    click.echo(f"Complete:       {complete}")
-    click.echo(f"Incomplete:     {len(videos) - complete}")
+    click.echo(f"Total scanned:  {total}")
+    click.echo(f"Complete:       {total_complete}")
+    click.echo(f"Incomplete:     {total_incomplete}")
+    if only_missing or not show_complete:
+        click.echo(f"Shown:          {len(display_rows)} (filtered)")
 
     if export_path:
         fieldnames = ["video"] + col_keys
@@ -878,14 +895,9 @@ def cmd_inspect(input_path, output_dir, recursive, export_path, show_complete, o
         with open(export_path, "w", encoding="utf-8-sig", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
             writer.writeheader()
-            full_rows = []
-            for vp in videos:
-                info = _inspect_one(vp, output_dir)
-                info["video"] = info["video"]
-                full_rows.append(info)
-            for info in full_rows:
+            for info in all_infos:
                 writer.writerow(info)
-        click.echo(f"\nCSV report saved -> {export_path}")
+        click.echo(f"\nCSV report saved -> {export_path}  ({total} rows)")
 
 
 @cli.command("pipe", help="End-to-end pipeline: transcribe -> translate -> merge -> burn")
@@ -1011,7 +1023,7 @@ def cmd_pipe(input_path, output_dir, recursive, whisper_model, device, compute_t
                 elif stage_completed_in_state(state, stg):
                     stages.append(f"SKIP(resume:{stg[:3]})")
                 elif _file_ok(paths[out_key]):
-                    stages.append(f"SKIP(file:{stg[:3]})")
+                    stages.append(f"SKIP(resume:{stg[:3]})")
                 else:
                     stages.append(stg.upper())
             prefix = "(SKIP) " if vp in skip_upfront else "(RUN)  "
@@ -1074,6 +1086,8 @@ def cmd_pipe(input_path, output_dir, recursive, whisper_model, device, compute_t
 
     pbar.close()
 
+    state_write_fails: List[str] = []
+
     for vp, reason in skip_upfront.items():
         paths = _derive_paths(vp, output_dir)
         video_info = {}
@@ -1081,6 +1095,10 @@ def cmd_pipe(input_path, output_dir, recursive, whisper_model, device, compute_t
             video_info = probe_video_info(vp)
         except Exception:
             video_info = {"duration_seconds": 0.0, "file_size_bytes": 0}
+
+        state = read_state_file(paths["state"]) or {}
+        state = _ensure_state_structure(state, paths, video_info)
+
         report_entry: Dict[str, Any] = {
             "video": os.path.basename(vp),
             "video_path": vp,
@@ -1098,25 +1116,58 @@ def cmd_pipe(input_path, output_dir, recursive, whisper_model, device, compute_t
                 "input_resolution": f"{video_info.get('width', 0)}x{video_info.get('height', 0)}",
             },
             "total_time": 0,
-            "note": "upfront-skipped: all stages complete",
+            "note": "upfront-skipped: resumed from state or cached output",
         }
+
         for stg, skip, out_key in [
             ("transcribe", skip_transcribe, "src_srt"),
             ("translate", skip_translate, "tgt_srt"),
             ("merge", skip_merge, "bilingual_srt"),
             ("burn", skip_burn, "output_video"),
         ]:
+            out_path = paths[out_key]
             report_entry["stages"][stg] = None
+
             if skip:
-                report_entry["stage_reasons"][stg] = "user --skip-" + stg
+                report_entry["stage_reasons"][stg] = "resume: user --skip-" + stg
                 report_entry["user_skipped_stages"].append(stg)
                 report_entry["skipped_stages"].append(stg)
-            elif _file_ok(paths[out_key]):
-                report_entry["stage_reasons"][stg] = "cached: output exists before run"
+                if stg not in state.get("stages", {}) or state["stages"][stg].get("status") not in ("skipped_by_user",):
+                    state["stages"][stg] = {
+                        "status": "skipped_by_user",
+                        "reason": "user passed --skip-" + stg,
+                        "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    }
+                continue
+
+            st_state = state.get("stages", {}).get(stg, {})
+            has_state_done = st_state.get("status") == "done" and st_state.get("output") and _file_ok(st_state.get("output"))
+            has_file = _file_ok(out_path)
+
+            if has_state_done:
+                report_entry["stage_reasons"][stg] = "resume: already done (from state)"
                 report_entry["skipped_stages"].append(stg)
-                report_entry["output_files"][out_key] = paths[out_key]
+                report_entry["output_files"][out_key] = out_path
+                if st_state.get("time_seconds") is not None:
+                    report_entry["stages"][stg] = st_state["time_seconds"]
+            elif has_file:
+                report_entry["stage_reasons"][stg] = "resume: output file exists"
+                report_entry["skipped_stages"].append(stg)
+                report_entry["output_files"][out_key] = out_path
+                state["stages"][stg] = {
+                    "status": "done",
+                    "output": out_path,
+                    "time_seconds": None,
+                    "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "note": "recovered from existing output file",
+                }
+            else:
+                pass
+
         if _file_ok(paths["src_srt"]):
             report_entry["metrics"]["src_srt_lines"] = count_srt_lines(paths["src_srt"])
+            if not state["stages"]["transcribe"].get("src_srt_lines"):
+                state["stages"]["transcribe"]["src_srt_lines"] = report_entry["metrics"]["src_srt_lines"]
         if _file_ok(paths["tgt_srt"]):
             report_entry["metrics"]["tgt_srt_lines"] = count_srt_lines(paths["tgt_srt"])
         if _file_ok(paths["bilingual_srt"]):
@@ -1132,7 +1183,37 @@ def cmd_pipe(input_path, output_dir, recursive, whisper_model, device, compute_t
             )
         if _file_ok(paths["merge_conflict"]):
             report_entry["metrics"]["merge_conflicts"] = count_merge_conflicts(paths["merge_conflict"])
+
+        all_done = all(
+            state.get("stages", {}).get(s, {}).get("status") in ("done", "skipped_by_user")
+            for s in STAGE_ORDER
+        )
+        if all_done:
+            state["status"] = "OK"
+        elif any(
+            state.get("stages", {}).get(s, {}).get("status") == "failed"
+            for s in STAGE_ORDER
+        ):
+            state["status"] = "FAIL"
+            report_entry["status"] = "FAIL"
+            report_entry["errors"].append("previous run had failed stage (check state file)")
+        else:
+            state["status"] = "OK"
+
+        state["total_time_seconds"] = 0
+
+        state_ok = write_state_file(paths["state"], state)
+        if not state_ok:
+            err = f"state file write failed: {paths['state']}"
+            report_entry["errors"].append(err)
+            state_write_fails.append(os.path.basename(vp))
+            if report_entry["status"] == "OK":
+                report_entry["status"] = "FAIL"
+
         results.append(report_entry)
+
+    if state_write_fails:
+        logger.warning(f"{len(state_write_fails)} video(s) failed to write state file: {', '.join(state_write_fails[:5])}")
 
     elapsed_total = time.time() - t_start_all
     results.sort(key=lambda r: r.get("video", ""))
